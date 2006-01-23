@@ -1,0 +1,305 @@
+#!/bin/env ruby
+require 'socket'
+require 'uri'
+require 'optparse'
+
+
+class Debug
+	@@on = false
+
+	def self.on
+		@@on = true
+	end
+
+	def self.off
+		@@on = false
+	end
+
+	def self.puts *messages
+		$stdout.puts messages if @@on
+	end
+end
+
+
+class State
+  def initialize &process_block
+    @process_block = process_block
+  end
+end
+
+
+class HeaderState < State
+  def initialize 
+    super
+    @headers = ''
+  end
+
+  def process machine, payload
+    unless match = payload.match(/\r\n\r\n/)
+      @headers += payload
+    else
+      @headers += match.pre_match
+      @process_block.call @headers if @process_block
+      machine.switch MusicState
+      machine.process match.post_match
+    end
+  end
+end
+
+
+class MusicState < State
+  attr_writer :metadata_boundary
+
+  def initialize
+    super
+    @bytes_processed = 0
+  end
+
+  def process machine, payload
+    @bytes_processed += payload.size
+    unless @bytes_processed > @metadata_boundary
+      @process_block.call payload
+    else
+      metadata_start_index = payload.size - (@bytes_processed - @metadata_boundary)
+      music = payload
+      metadata = music.slice! metadata_start_index..-1
+      @bytes_processed = 0
+      @process_block.call music
+      machine.switch MetadataState
+      machine.process metadata
+    end
+  end
+end
+
+
+class MetadataState < State
+  def initialize
+    super
+    @metadata, @metadata_length = '', nil
+  end
+
+  def process machine, payload
+    if @metadata_length.nil?
+      @metadata_length = payload.slice!(0) * 16
+      Debug.puts "Found #@metadata_length bytes of metadata"
+      machine.process payload
+    else
+      @metadata += payload
+      if @metadata.size > @metadata_length
+        Debug.puts "Before slice: #{@metadata.size}"
+        music = @metadata.slice! @metadata_length..-1
+        Debug.puts "After slice, metadata = #{@metadata.size}, music = #{music.size}"
+        @metadata = @metadata.split(0.chr).first
+        @process_block.call @metadata if @metadata_length > 0 and @process_block 
+        @metadata, @metadata_length = '', nil
+        machine.switch MusicState
+        machine.process music
+      end
+    end
+  end
+end
+
+
+class StreamReader
+	def initialize url
+		u = URI.parse url
+		u.path = '/' if u.path.empty?
+		@host, @port, @path = u.host, u.port, u.path
+		@buf_size = 256
+	end
+
+  def read
+    unless @t
+      @t = TCPSocket.new @host, @port
+      @t.print "GET #@path HTTP/1.0\r\nHost: #@host\r\nUser-Agent: #$0\r\nConnection: close\r\nIcy-Metadata: 1\r\n\r\n"
+    end
+    @t.read @buf_size
+  end
+
+  def close
+    @t.close
+  end
+end
+
+
+class FileReader
+  def initialize *args
+    @file = File.open 'test'
+  end
+
+  def read
+    @file.read 8192
+  end
+
+  def close
+    @file.close
+  end
+end
+
+
+class TooManyBytesWritten < RuntimeError; end
+class StreamWriter
+  attr_reader :bytes_written
+
+	def initialize dir, max_bytes_to_write
+    @dir, @max_bytes_to_write = dir, max_bytes_to_write
+    @file = nil
+    @bytes_written = 0
+	end
+
+  def write bytes
+    return nil unless @file
+    if (@bytes_written += bytes.size) > @max_bytes_to_write
+      bytes.slice! @max_bytes_to_write - @bytes_written..-1
+      @file.print bytes
+      @bytes_written = @max_bytes_to_write
+      self.close
+      raise TooManyBytesWritten
+    else
+      @file.print bytes
+    end
+  end
+
+  def filename= filename
+    Debug.puts "Changed filename to #{filename}"
+    self.close
+    @file = File.open File.join(@dir, filename), 'w'
+  end
+
+  def close
+    @file.close if @file
+  end
+end
+
+
+class StateMachine
+  attr_reader :current
+
+	def initialize
+		@states = []
+		@start = nil
+		@current = nil
+	end
+
+	def register state
+    @states << state
+	end
+
+  def switch klass
+    @current = @states.find { |s| s.class == klass}
+  end
+
+  alias_method :start=, :switch
+
+	def process payload
+		if @current.nil?
+			@start ? @current = @start : raise('No starting state set')
+		end
+		@current.process self, payload
+	end
+end
+
+
+class StreamRecorder
+  def initialize reader, writer
+    @reader, @writer = reader, writer
+    @songs_written = 0
+    @last_artist, @last_song = '', ''
+    @states = {}
+
+    @states[:music] =  MusicState.new do |m|
+      Debug.puts "Received #{m.size} bytes of music"
+      begin
+        @writer.write m
+      rescue TooManyBytesWritten
+        @reader.close
+        raise
+      end
+    end
+
+    @states[:metadata] = MetadataState.new do |md| 
+      Debug.puts 'Got metadata', '', md, '', ''
+      
+      
+      title = md.match(/^StreamTitle='(.*)';StreamUrl='.*';$/).captures.first
+      artist, *song = title.split ' - '
+      artist, song = artist.strip, song.join(' - ').strip
+      unless artist == @last_artist and song == @last_song
+        filename = "#{sprintf '%.3d', @songs_written += 1}-#{artist}-#{song}.mp3".to_filename
+        @writer.filename = filename 
+        @last_artist, @last_song = artist, song
+      end
+    end
+
+    @states[:header] = HeaderState.new do |h|
+      Debug.puts 'Got headers', '', h, '', ''
+      @states[:music].metadata_boundary = h.match(/^Icy-Metaint:\s*(\d+)\s*$/i).captures.first.to_i
+    end
+
+    @machine = StateMachine.new
+    @states.each_value { |s| @machine.register s }
+    @machine.start = @states[:header].class
+  end
+
+  def run
+    while chunk = @reader.read
+      @machine.process chunk
+      yield @writer.bytes_written if block_given?
+    end
+  end
+end
+
+
+class String
+  def to_filename
+    self.downcase.tr(' ', '_').tr('^A-Za-z0-9_.-', '')
+  end
+end
+
+
+class Time
+  def minutes_since
+    sprintf '%.2f', (self.class.now - self) / 60
+  end
+end
+
+
+def main
+	options = { :url => nil, :output_directory => nil, :max_bytes_to_write => nil}
+	opt_parser = OptionParser.new do |o|
+		o.banner = "Usage: #$0 [options]"
+		o.on('-u', '--url URL', 'URL of stream to record') { |options[:url]| }
+		o.on('-w', '--write-to DIRNAME', 'Directory to write songs to') { |options[:output_directory]| }
+		o.on('-m', '--mebibytes mebibytes', Integer, 'Number of mebibytes to record') { |m| options[:max_bytes_to_write] = m * 1024 * 1024 }
+		o.on('-v', '--[no-]verbose', 'Run verbosely') { |v| Debug.on if v }
+		o.parse! ARGV
+	end
+	if options.values.include? nil
+		puts opt_parser
+		exit
+	end
+
+	reader = StreamReader.new options[:url]
+  #reader = FileReader.new
+  writer = StreamWriter.new options[:output_directory], options[:max_bytes_to_write]
+  recorder = StreamRecorder.new reader, writer
+
+	started = Time.now
+	last_output_at, bytes_written = nil, nil
+  begin
+    recorder.run do |bytes_written|
+      if not last_output_at or Time.now - last_output_at > 15
+        puts "[#{sprintf('%.2f%%', bytes_written / options[:max_bytes_to_write].to_f * 100).center 6}]  " +
+        "#{started.minutes_since} minutes recorded, " +
+        "#{sprintf '%.2f', bytes_written / 1024.0 / 1024.0} MiB consumed."
+        last_output_at = Time.now
+      end
+    end
+  rescue TooManyBytesWritten
+  ensure
+    puts("Done. #{started.minutes_since} minutes recorded for #{sprintf '%.2f', bytes_written / 1024.0 / 1024.0} MiB.")
+  end
+end
+
+
+main
